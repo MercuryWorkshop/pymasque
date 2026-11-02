@@ -196,7 +196,7 @@ class WarpStream:
       return None
     return data
 
-  async def send(self, data, *, max_buffered=None):
+  async def send(self, data, max_buffered=None):
     if not data:
       return
     if self.state is WarpStream.CLOSED:
@@ -340,15 +340,3 @@ class WarpConnection:
         await self.quic_protocol.ping()
       except Exception:
         continue
-  
-async def test_main():
-  logging.basicConfig(
-    format="[%(asctime)s] %(levelname)-8s %(message)s",
-    level=logging.DEBUG,
-    datefmt="%Y/%m/%d - %H:%M:%S"
-  )
-  await read_registration()
-  conn = WarpConnection()
-  await conn.connect()
-  await conn.quic_protocol.wait_closed()
-  await conn.close()
