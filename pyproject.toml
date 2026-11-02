@@ -30,6 +30,11 @@ dependencies = [
   "platformdirs"
 ]
 
+[project.optional-dependencies]
+socks = [
+  "asyncio-socks-server"
+]
+
 [project.urls]
 Homepage = "https://github.com/MercuryWorkshop/pymasque"
 Issues = "https://github.com/MercuryWorkshop/pymasque/issues"

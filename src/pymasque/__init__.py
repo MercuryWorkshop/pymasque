@@ -198,10 +198,29 @@ class WarpStream:
     return data
 
   async def send(self, data, *, max_buffered=None):
-    limit = self.max_buffered if max_buffered is None else max_buffered
     if not data:
       return
+    if self.state is WarpStream.CLOSED:
+      raise ConnectionResetError(f"stream {self.id} closed")
+    self.write(data)
+    await self.drain(max_buffered=max_buffered)
+
+  def write(self, data):
+    if not data or self.state is WarpStream.CLOSED:
+      return
+    try:
+      self.proto.h3.send_data(self.id, data, False)
+      self.proto.transmit()
+    except (ValueError, RuntimeError) as e:
+      raise ConnectionResetError(f"stream {self.id} closed") from e
+
+  async def drain(self, max_buffered=None):
+    if self.state is WarpStream.CLOSED:
+      return
+    limit = self.max_buffered if max_buffered is None else max_buffered
     while limit is not None and self.proto._quic.get_send_buffer_size(self.id) > limit:
+      if self.state is WarpStream.CLOSED:
+        return
       if self.proto.closed:
         raise ConnectionError(f"stream {self.id} connection closed")
       fut = asyncio.get_running_loop().create_future()
@@ -210,24 +229,33 @@ class WarpStream:
         await fut
       finally:
         self.proto.send_waiters.discard(fut)
-    try:
-      self.proto.h3.send_data(self.id, data, False)
-      self.proto.transmit()
-    except (ValueError, RuntimeError) as e:
-      raise ConnectionResetError(f"stream {self.id} closed") from e
 
   def close(self):
     self.state = WarpStream.CLOSED
+    try:
+      self.incoming.put_nowait((None, True))
+    except Exception:
+      pass
     self.proto.reset_h3_stream(self.id)
     self.proto.streams.pop(self.id, None)
     self.proto.notify_send_waiters()
     if not self.headers.done():
       self.headers.cancel()
 
+  async def read(self, n=-1):
+    return await self.recv() or b""
+
+  async def wait_closed(self):
+    return None
+
 class WarpConnection:
+  OPEN, CLOSING = range(2)
+
   def __init__(self):
     self.quic_context = None
     self.quic_protocol = None
+    self.state = WarpConnection.OPEN
+    
   async def connect(self):
     if self.quic_protocol is not None and not self.quic_protocol.closed:
       return self.quic_protocol
@@ -278,7 +306,20 @@ class WarpConnection:
     self.quic_context = None
     self.quic_protocol = None
 
+  def close_all(self):
+    self.state = WarpConnection.CLOSING
+    proto = self.quic_protocol
+    if proto is None:
+      return
+    for stream in list(proto.streams.values()):
+      try:
+        stream.close()
+      except Exception:
+        pass
+
   async def open_stream(self, hostname, port, timeout=15, max_buffered=128*1024):
+    if self.state is WarpConnection.CLOSING:
+      raise ConnectionError("server shutting down")
     proto = await self.connect()
     try:
       ip = str(ipaddress.ip_address(hostname))
