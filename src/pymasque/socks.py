@@ -5,6 +5,12 @@ try:
 except ImportError as e:
   raise ImportError("asyncio-socks-server is required for pymasque.socks. Run \"pip install 'pymasque[socks]'\" to install it.")
 
+try:
+  import asyncio, uvloop
+  asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError as e:
+  pass
+
 class WarpAddon(Addon):
   def __init__(self):
     self.warp = WarpConnection()

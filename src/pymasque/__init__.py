@@ -141,7 +141,6 @@ class WarpQuicProtocol(qh3.asyncio.QuicConnectionProtocol):
     for h3_event in self.h3.handle_event(event):
       if stream := self.streams.get(h3_event.stream_id):
         stream.on_h3_event(h3_event)
-    self.notify_send_waiters()
 
 class WarpStream:
   CONNECTING, OPEN, CLOSED = range(3)
