@@ -4,7 +4,9 @@ import logging
 import re
 import json
 import ssl
+import socket
 import asyncio
+import ipaddress
 from datetime import datetime, timezone, timedelta
 
 import platformdirs
@@ -90,11 +92,19 @@ async def read_registration():
     logging.info(f"saved cf warp registration data to {registration_file}")
     return registration
 
-class _WarpQuicProtocol(qh3.asyncio.QuicConnectionProtocol):
+async def resolve_ip(hostname):
+  try:
+    infos = await asyncio.get_running_loop().getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+  except socket.gaierror as e:
+    raise ConnectionError(f"DNS resolution failed for {hostname}: {e}") from e
+  return str(ipaddress.ip_address(infos[0][4][0]))
+
+class WarpQuicProtocol(qh3.asyncio.QuicConnectionProtocol):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
     self.h3 = qh3.H3Connection(self._quic)
     self.streams = {}
+    self.send_waiters = set()
 
   @property
   def closed(self):
@@ -114,82 +124,110 @@ class _WarpQuicProtocol(qh3.asyncio.QuicConnectionProtocol):
     except Exception:
       pass
 
+  def notify_send_waiters(self):
+    for fut in list(self.send_waiters):
+      if not fut.done():
+        fut.set_result(None)
+
+  def transmit(self):
+    try:
+      super().transmit()
+    finally:
+      self.notify_send_waiters()
+
   def quic_event_received(self, event):
-    super().quic_event_received(event)
+    if getattr(event, "stream_id", None) is None:
+      super().quic_event_received(event)
     for h3_event in self.h3.handle_event(event):
-      stream = self.streams.get(h3_event.stream_id)
-      if stream is not None:
+      if stream := self.streams.get(h3_event.stream_id):
         stream.on_h3_event(h3_event)
+    self.notify_send_waiters()
 
 class WarpStream:
-  def __init__(self, proto, stream_id, timeout=15):
-    self._proto = proto
-    self._id = stream_id
-    self._timeout = timeout
-    self._headers = asyncio.get_running_loop().create_future()
-    self._incoming = asyncio.Queue()
-    self._ready = False
-    self._eof = False
-    proto.streams[stream_id] = self
+  CONNECTING, OPEN, CLOSED = range(3)
+
+  def __init__(self, proto, stream_id, timeout=15, max_buffered=128*1024):
+    self.proto = proto
+    self.id = stream_id
+    self.timeout = timeout
+    self.max_buffered = max_buffered
+    self.headers = asyncio.get_running_loop().create_future()
+    self.incoming = asyncio.Queue()
+    self.state = WarpStream.CONNECTING
+    self.proto.streams[stream_id] = self
 
   def on_h3_event(self, hev):
     if isinstance(hev, qh3.h3_events.HeadersReceived):
-      if not self._headers.done():
-        self._headers.set_result((hev.headers, hev.stream_ended))
+      if not self.headers.done():
+        self.headers.set_result((hev.headers, hev.stream_ended))
       if hev.stream_ended:
-        self._incoming.put_nowait((b"", True))
+        self.incoming.put_nowait((b"", True))
     elif isinstance(hev, qh3.h3_events.DataReceived):
-      self._incoming.put_nowait((hev.data, hev.stream_ended))
+      self.incoming.put_nowait((hev.data, hev.stream_ended))
     elif isinstance(hev, (qh3.h3_events.StreamReset, qh3.h3_events.StopSending)):
-      self._incoming.put_nowait((None, True))
-      if not self._headers.done():
-        self._headers.set_exception(ConnectionResetError(f"stream {self._id} reset"))
+      self.incoming.put_nowait((None, True))
+      if not self.headers.done():
+        self.headers.set_exception(ConnectionResetError(f"stream {self.id} reset"))
+      self.proto.notify_send_waiters()
 
   async def ensure_response(self):
-    if self._ready:
+    if self.state is WarpStream.OPEN:
       return
     try:
-      async with asyncio.timeout(self._timeout):
-        headers, _ = await self._headers
+      async with asyncio.timeout(self.timeout):
+        headers = (await self.headers)[0]
     except TimeoutError:
       raise ConnectionError("CONNECT timed out")
     status = dict(headers).get(b":status", b"").decode()
     if not status.startswith("2"):
       raise ConnectionError(f"CONNECT rejected with status {status}")
-    self._ready = True
+    self.state = WarpStream.OPEN
 
   async def recv(self):
-    await self.ensure_response()
-    if self._eof:
-      return b""
-    data, ended = await self._incoming.get()
-    if data is None or ended:
-      self._eof = True
-      return bytes(data or b"")
-    return bytes(data)
-
-  async def send(self, data):
+    if self.state is WarpStream.CLOSED:
+      return None
     try:
-      self._proto.h3.send_data(self._id, data, False)
-      self._proto.transmit()
-    except (ValueError, RuntimeError) as e:
-      raise ConnectionResetError(f"stream {self._id} closed") from e
+      await self.ensure_response()
+    except ConnectionError:
+      self.state = WarpStream.CLOSED
+      return None
+    data, ended = await self.incoming.get()
+    if data is None or ended:
+      self.state = WarpStream.CLOSED
+      return None
+    return data
 
-  def write_eof(self):
-    self._proto.h3.send_data(self._id, b"", True)
-    self._proto.transmit()
+  async def send(self, data, *, max_buffered=None):
+    limit = self.max_buffered if max_buffered is None else max_buffered
+    if not data:
+      return
+    while limit is not None and self.proto._quic.get_send_buffer_size(self.id) > limit:
+      if self.proto.closed:
+        raise ConnectionError(f"stream {self.id} connection closed")
+      fut = asyncio.get_running_loop().create_future()
+      self.proto.send_waiters.add(fut)
+      try:
+        await fut
+      finally:
+        self.proto.send_waiters.discard(fut)
+    try:
+      self.proto.h3.send_data(self.id, data, False)
+      self.proto.transmit()
+    except (ValueError, RuntimeError) as e:
+      raise ConnectionResetError(f"stream {self.id} closed") from e
 
   def close(self):
-    self._proto.reset_h3_stream(self._id)
-    self._proto.streams.pop(self._id, None)
-    if not self._headers.done():
-      self._headers.cancel()
+    self.state = WarpStream.CLOSED
+    self.proto.reset_h3_stream(self.id)
+    self.proto.streams.pop(self.id, None)
+    self.proto.notify_send_waiters()
+    if not self.headers.done():
+      self.headers.cancel()
 
 class WarpConnection:
   def __init__(self):
     self.quic_context = None
     self.quic_protocol = None
-
   async def connect(self):
     if self.quic_protocol is not None and not self.quic_protocol.closed:
       return self.quic_protocol
@@ -222,7 +260,7 @@ class WarpConnection:
     )
     
     logging.info("connecting to cloudflare warp server")
-    self.quic_context = qh3.asyncio.connect(registration["endpoint_ipv4"], 443, configuration=quic_config, create_protocol=_WarpQuicProtocol)
+    self.quic_context = qh3.asyncio.connect(registration["endpoint_ipv4"], 443, configuration=quic_config, create_protocol=WarpQuicProtocol)
     self.quic_protocol = await self.quic_context.__aenter__()
 
     peer_public_key = self.quic_protocol.peercert.public_key()
@@ -240,16 +278,20 @@ class WarpConnection:
     self.quic_context = None
     self.quic_protocol = None
 
-  async def open_stream(self, target, timeout=15):
+  async def open_stream(self, hostname, port, timeout=15, max_buffered=128*1024):
     proto = await self.connect()
-    s = WarpStream(proto, proto.open_h3_stream_id(), timeout)
-    proto.h3.send_headers(s._id, [
+    try:
+      ip = str(ipaddress.ip_address(hostname))
+    except ValueError:
+      ip = await resolve_ip(hostname)
+    authority = f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+    stream = WarpStream(proto, proto.open_h3_stream_id(), timeout, max_buffered)
+    proto.h3.send_headers(stream.id, [
       (b":method", b"CONNECT"),
-      (b":authority", target.encode()),
-      (b"host", target.encode()),
+      (b":authority", authority.encode()),
     ], end_stream=False)
     proto.transmit()
-    return s
+    return stream
   
   async def keepalive(self):
     while self.quic_protocol:

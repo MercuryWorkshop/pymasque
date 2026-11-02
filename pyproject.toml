@@ -16,7 +16,7 @@ license = "LGPL-3.0-or-later"
 authors = [
   {name="ading2210"},
 ]
-description = "An implementation of a Cloudflare Warp MASQUE client in Python."
+description = "A minimal implementation of a Cloudflare Warp MASQUE client in Python."
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
