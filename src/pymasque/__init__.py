@@ -172,14 +172,19 @@ class WarpStream:
   async def ensure_response(self):
     if self.state is WarpStream.OPEN:
       return
+    if self.state is WarpStream.CLOSED:
+      raise ConnectionResetError(f"stream {self.id} closed")
+
     try:
       async with asyncio.timeout(self.timeout):
         headers = (await self.headers)[0]
-    except TimeoutError:
-      raise ConnectionError("CONNECT timed out")
-    status = dict(headers).get(b":status", b"").decode()
-    if not status.startswith("2"):
-      raise ConnectionError(f"CONNECT rejected with status {status}")
+      status = dict(headers).get(b":status", b"").decode()
+      if not status.startswith("2"):
+        raise ConnectionError(f"CONNECT rejected with status {status}")
+
+    except:
+      self.close()
+      raise
     self.state = WarpStream.OPEN
 
   async def recv(self):
@@ -188,7 +193,6 @@ class WarpStream:
     try:
       await self.ensure_response()
     except ConnectionError:
-      self.state = WarpStream.CLOSED
       return None
     data, ended = await self.incoming.get()
     if data is None or ended:
@@ -320,10 +324,12 @@ class WarpConnection:
     if self.state is WarpConnection.CLOSING:
       raise ConnectionError("server shutting down")
     proto = await self.connect()
+    
     try:
       ip = str(ipaddress.ip_address(hostname))
     except ValueError:
       ip = await resolve_ip(hostname)
+
     authority = f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
     stream = WarpStream(proto, proto.open_h3_stream_id(), timeout, max_buffered)
     proto.h3.send_headers(stream.id, [
@@ -331,6 +337,8 @@ class WarpConnection:
       (b":authority", authority.encode()),
     ], end_stream=False)
     proto.transmit()
+
+    await stream.ensure_response()
     return stream
   
   async def keepalive(self):
