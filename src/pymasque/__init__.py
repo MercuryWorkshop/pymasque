@@ -20,12 +20,12 @@ from cryptography.hazmat.primitives.serialization import load_der_private_key, l
 #a client for the cloudflare warp l4 proxy service
 #based on https://github.com/Diniboy1123/usque
 
-cf_api = "https://api.cloudflareclient.com/v0a4471"
-cf_headers = {
+CF_API = "https://api.cloudflareclient.com/v0a4471"
+CF_HEADERS = {
   "User-Agent": "WARP for Android",
   "CF-Client-Version": "a-6.35-4471"
 }
-cf_sni = "consumer-masque-proxy.cloudflareclient.com"
+CF_SNI = "consumer-masque-proxy.cloudflareclient.com"
 
 dirs = platformdirs.PlatformDirs("pymasque")
 data_dir = dirs.user_data_path
@@ -35,7 +35,7 @@ async def register():
   reg_key = base64.b64encode(os.urandom(32)).decode()
   tos_date = datetime.now().astimezone().isoformat(timespec="milliseconds")
 
-  reg_response = await niquests.apost(cf_api + "/reg", json={
+  reg_response = await niquests.apost(CF_API + "/reg", json={
     "key": reg_key,
     "install_id": "",
     "fcm_token": "",
@@ -46,7 +46,7 @@ async def register():
     "key_type": "curve25519",
     "tunnel_type": "wireguard",
     "locale": "en_US"
-  }, headers=cf_headers)
+  }, headers=CF_HEADERS)
   reg_response.raise_for_status()
   registration = reg_response.json()
 
@@ -58,12 +58,12 @@ async def register():
   public_key_der = private_key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
   public_key_str = base64.b64encode(public_key_der).decode()
 
-  enroll_response = await niquests.apatch(cf_api + f"/reg/{device_id}", json={
+  enroll_response = await niquests.apatch(CF_API + f"/reg/{device_id}", json={
     "key": public_key_str,
     "key_type": "secp256r1",
     "tunnel_type": "masque",
     "name": ""
-  }, headers={**cf_headers, "Authorization": f"Bearer {token}"})
+  }, headers={**CF_HEADERS, "Authorization": f"Bearer {token}"})
   enroll_response.raise_for_status()
   enrollment = enroll_response.json()
 
@@ -250,6 +250,9 @@ class WarpStream:
 
   async def wait_closed(self):
     return None
+  
+  def is_closing(self):
+    return self.state == WarpStream.CLOSED
 
 class WarpConnection:
   OPEN, CLOSING = range(2)
@@ -284,7 +287,7 @@ class WarpConnection:
     quic_cert = qh3._hazmat.Certificate(cert_der)
 
     quic_config = qh3.QuicConfiguration(
-      is_client=True, alpn_protocols=["h3"], server_name=cf_sni,
+      is_client=True, alpn_protocols=["h3"], server_name=CF_SNI,
       certificate=quic_cert, private_key=quic_private_key,
       verify_mode=ssl.CERT_NONE, verify_hostname=False,
       offer_ec_key_shares=True,
